@@ -1506,15 +1506,16 @@ function ExportPage() {
 
   const buildExportOptions = (scope: TaskScope, contentType?: ContentType): ElectronExportOptions => {
     const sessionLayout: SessionLayout = writeLayout === 'C' ? 'per-session' : 'shared'
+    const exportMediaEnabled = Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
 
     const base: ElectronExportOptions = {
       format: options.format,
       exportAvatars: options.exportAvatars,
-      exportMedia: options.exportMedia,
-      exportImages: options.exportMedia && options.exportImages,
-      exportVoices: options.exportMedia && options.exportVoices,
-      exportVideos: options.exportMedia && options.exportVideos,
-      exportEmojis: options.exportMedia && options.exportEmojis,
+      exportMedia: exportMediaEnabled,
+      exportImages: options.exportImages,
+      exportVoices: options.exportVoices,
+      exportVideos: options.exportVideos,
+      exportEmojis: options.exportEmojis,
       exportVoiceAsText: options.exportVoiceAsText,
       excelCompactColumns: options.excelCompactColumns,
       txtColumns: options.txtColumns,
@@ -1558,6 +1559,7 @@ function ExportPage() {
 
   const buildSnsExportOptions = () => {
     const format: 'json' | 'html' = options.format === 'json' ? 'json' : 'html'
+    const exportMediaEnabled = Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
     const dateRange = options.useAllTime
       ? null
       : options.dateRange
@@ -1569,7 +1571,7 @@ function ExportPage() {
 
     return {
       format,
-      exportMedia: options.exportMedia,
+      exportMedia: exportMediaEnabled,
       startTime: dateRange?.startTime,
       endTime: dateRange?.endTime
     }
@@ -1803,7 +1805,7 @@ function ExportPage() {
     closeExportDialog()
 
     await configService.setExportDefaultFormat(options.format)
-    await configService.setExportDefaultMedia(options.exportMedia)
+    await configService.setExportDefaultMedia(Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis))
     await configService.setExportDefaultVoiceAsText(options.exportVoiceAsText)
     await configService.setExportDefaultExcelCompactColumns(options.excelCompactColumns)
     await configService.setExportDefaultTxtColumns(options.txtColumns)
@@ -3018,23 +3020,11 @@ function ExportPage() {
 
               <div className="dialog-section">
                 <h4>媒体与头像</h4>
-                <div className="switch-row">
-                  <span>导出媒体文件</span>
-                  <label className="switch">
-                    <input
-                      type="checkbox"
-                      checked={options.exportMedia}
-                      onChange={(event) => setOptions(prev => ({ ...prev, exportMedia: event.target.checked }))}
-                    />
-                    <span className="switch-slider"></span>
-                  </label>
-                </div>
-
                 <div className="media-check-grid">
-                  <label><input type="checkbox" checked={options.exportImages} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportImages: event.target.checked }))} /> 图片</label>
-                  <label><input type="checkbox" checked={options.exportVoices} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportVoices: event.target.checked }))} /> 语音</label>
-                  <label><input type="checkbox" checked={options.exportVideos} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportVideos: event.target.checked }))} /> 视频</label>
-                  <label><input type="checkbox" checked={options.exportEmojis} disabled={!options.exportMedia} onChange={event => setOptions(prev => ({ ...prev, exportEmojis: event.target.checked }))} /> 表情包</label>
+                  <label><input type="checkbox" checked={options.exportImages} onChange={event => setOptions(prev => ({ ...prev, exportImages: event.target.checked }))} /> 图片</label>
+                  <label><input type="checkbox" checked={options.exportVoices} onChange={event => setOptions(prev => ({ ...prev, exportVoices: event.target.checked }))} /> 语音</label>
+                  <label><input type="checkbox" checked={options.exportVideos} onChange={event => setOptions(prev => ({ ...prev, exportVideos: event.target.checked }))} /> 视频</label>
+                  <label><input type="checkbox" checked={options.exportEmojis} onChange={event => setOptions(prev => ({ ...prev, exportEmojis: event.target.checked }))} /> 表情包</label>
                   <label><input type="checkbox" checked={options.exportVoiceAsText} onChange={event => setOptions(prev => ({ ...prev, exportVoiceAsText: event.target.checked }))} /> 语音转文字</label>
                   <label><input type="checkbox" checked={options.exportAvatars} onChange={event => setOptions(prev => ({ ...prev, exportAvatars: event.target.checked }))} /> 导出头像</label>
                 </div>
