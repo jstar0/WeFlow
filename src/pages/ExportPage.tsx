@@ -971,6 +971,8 @@ function ExportPage() {
   const activeTaskCountRef = useRef(0)
   const hasBaseConfigReadyRef = useRef(false)
   const contentSessionCountsForceRetryRef = useRef(0)
+  const contentSessionCountsInFlightRef = useRef<Promise<void> | null>(null)
+  const contentSessionCountsInFlightTraceRef = useRef('')
 
   const appendFrontendDiagLog = useCallback((entry: ExportCardDiagLogEntry) => {
     setFrontendDiagLogs(prev => {
@@ -1537,130 +1539,159 @@ function ExportPage() {
   }, [])
 
   const loadContentSessionCounts = useCallback(async (options?: { silent?: boolean; forceRefresh?: boolean }) => {
+    if (contentSessionCountsInFlightRef.current) {
+      logFrontendDiag({
+        level: 'info',
+        stepId: 'frontend-load-content-session-counts',
+        stepName: '前端请求导出卡片统计',
+        status: 'running',
+        message: '统计请求仍在进行中，跳过本次轮询',
+        data: {
+          silent: options?.silent === true,
+          forceRefresh: options?.forceRefresh === true,
+          inFlightTraceId: contentSessionCountsInFlightTraceRef.current || undefined
+        }
+      })
+      return
+    }
+
     const traceId = createExportDiagTraceId()
     const startedAt = Date.now()
-    logFrontendDiag({
-      traceId,
-      stepId: 'frontend-load-content-session-counts',
-      stepName: '前端请求导出卡片统计',
-      status: 'running',
-      message: '开始请求导出卡片统计',
-      data: {
-        silent: options?.silent === true,
-        forceRefresh: options?.forceRefresh === true
-      }
-    })
-    try {
-      const result = await withTimeout(
-        window.electronAPI.chat.getExportContentSessionCounts({
-          triggerRefresh: true,
-          forceRefresh: options?.forceRefresh === true,
-          traceId
-        }),
-        3200
-      )
-      if (!result) {
-        logFrontendDiag({
-          traceId,
-          level: 'warn',
-          stepId: 'frontend-load-content-session-counts',
-          stepName: '前端请求导出卡片统计',
-          status: 'timeout',
-          durationMs: Date.now() - startedAt,
-          message: '导出卡片统计请求超时（3200ms）'
-        })
-        return
-      }
-      if (result?.success && result.data) {
-        const next: ExportContentSessionCountsSummary = {
-          totalSessions: Number.isFinite(result.data.totalSessions) ? Math.max(0, Math.floor(result.data.totalSessions)) : 0,
-          textSessions: Number.isFinite(result.data.textSessions) ? Math.max(0, Math.floor(result.data.textSessions)) : 0,
-          voiceSessions: Number.isFinite(result.data.voiceSessions) ? Math.max(0, Math.floor(result.data.voiceSessions)) : 0,
-          imageSessions: Number.isFinite(result.data.imageSessions) ? Math.max(0, Math.floor(result.data.imageSessions)) : 0,
-          videoSessions: Number.isFinite(result.data.videoSessions) ? Math.max(0, Math.floor(result.data.videoSessions)) : 0,
-          emojiSessions: Number.isFinite(result.data.emojiSessions) ? Math.max(0, Math.floor(result.data.emojiSessions)) : 0,
-          pendingMediaSessions: Number.isFinite(result.data.pendingMediaSessions) ? Math.max(0, Math.floor(result.data.pendingMediaSessions)) : 0,
-          updatedAt: Number.isFinite(result.data.updatedAt) ? Math.max(0, Math.floor(result.data.updatedAt)) : 0,
-          refreshing: result.data.refreshing === true
+    const task = (async () => {
+      logFrontendDiag({
+        traceId,
+        stepId: 'frontend-load-content-session-counts',
+        stepName: '前端请求导出卡片统计',
+        status: 'running',
+        message: '开始请求导出卡片统计',
+        data: {
+          silent: options?.silent === true,
+          forceRefresh: options?.forceRefresh === true
         }
-        setContentSessionCounts(next)
-        const looksLikeAllZero = next.totalSessions > 0 &&
-          next.textSessions === 0 &&
-          next.voiceSessions === 0 &&
-          next.imageSessions === 0 &&
-          next.videoSessions === 0 &&
-          next.emojiSessions === 0
-
-        if (looksLikeAllZero && contentSessionCountsForceRetryRef.current < 3) {
-          contentSessionCountsForceRetryRef.current += 1
-          const refreshTraceId = createExportDiagTraceId()
+      })
+      try {
+        const result = await withTimeout(
+          window.electronAPI.chat.getExportContentSessionCounts({
+            triggerRefresh: true,
+            forceRefresh: options?.forceRefresh === true,
+            traceId
+          }),
+          3200
+        )
+        if (!result) {
           logFrontendDiag({
-            traceId: refreshTraceId,
-            stepId: 'frontend-force-refresh-content-session-counts',
-            stepName: '前端触发强制刷新导出卡片统计',
-            status: 'running',
-            message: '检测到统计全0，触发强制刷新'
+            traceId,
+            level: 'warn',
+            stepId: 'frontend-load-content-session-counts',
+            stepName: '前端请求导出卡片统计',
+            status: 'timeout',
+            durationMs: Date.now() - startedAt,
+            message: '导出卡片统计请求超时（3200ms，后台可能仍在处理）'
           })
-          void window.electronAPI.chat.refreshExportContentSessionCounts({ forceRefresh: true, traceId: refreshTraceId }).then((refreshResult) => {
+          return
+        }
+        if (result?.success && result.data) {
+          const next: ExportContentSessionCountsSummary = {
+            totalSessions: Number.isFinite(result.data.totalSessions) ? Math.max(0, Math.floor(result.data.totalSessions)) : 0,
+            textSessions: Number.isFinite(result.data.textSessions) ? Math.max(0, Math.floor(result.data.textSessions)) : 0,
+            voiceSessions: Number.isFinite(result.data.voiceSessions) ? Math.max(0, Math.floor(result.data.voiceSessions)) : 0,
+            imageSessions: Number.isFinite(result.data.imageSessions) ? Math.max(0, Math.floor(result.data.imageSessions)) : 0,
+            videoSessions: Number.isFinite(result.data.videoSessions) ? Math.max(0, Math.floor(result.data.videoSessions)) : 0,
+            emojiSessions: Number.isFinite(result.data.emojiSessions) ? Math.max(0, Math.floor(result.data.emojiSessions)) : 0,
+            pendingMediaSessions: Number.isFinite(result.data.pendingMediaSessions) ? Math.max(0, Math.floor(result.data.pendingMediaSessions)) : 0,
+            updatedAt: Number.isFinite(result.data.updatedAt) ? Math.max(0, Math.floor(result.data.updatedAt)) : 0,
+            refreshing: result.data.refreshing === true
+          }
+          setContentSessionCounts(next)
+          const looksLikeAllZero = next.totalSessions > 0 &&
+            next.textSessions === 0 &&
+            next.voiceSessions === 0 &&
+            next.imageSessions === 0 &&
+            next.videoSessions === 0 &&
+            next.emojiSessions === 0
+
+          if (looksLikeAllZero && contentSessionCountsForceRetryRef.current < 3) {
+            contentSessionCountsForceRetryRef.current += 1
+            const refreshTraceId = createExportDiagTraceId()
             logFrontendDiag({
               traceId: refreshTraceId,
               stepId: 'frontend-force-refresh-content-session-counts',
               stepName: '前端触发强制刷新导出卡片统计',
-              status: refreshResult?.success ? 'done' : 'failed',
-              level: refreshResult?.success ? 'info' : 'warn',
-              message: refreshResult?.success ? '强制刷新请求已提交' : `强制刷新失败：${refreshResult?.error || '未知错误'}`
+              status: 'running',
+              message: '检测到统计全0，触发强制刷新'
             })
-          }).catch((error) => {
-            logFrontendDiag({
-              traceId: refreshTraceId,
-              stepId: 'frontend-force-refresh-content-session-counts',
-              stepName: '前端触发强制刷新导出卡片统计',
-              status: 'failed',
-              level: 'error',
-              message: '强制刷新请求异常',
-              data: { error: String(error) }
+            void window.electronAPI.chat.refreshExportContentSessionCounts({ forceRefresh: true, traceId: refreshTraceId }).then((refreshResult) => {
+              logFrontendDiag({
+                traceId: refreshTraceId,
+                stepId: 'frontend-force-refresh-content-session-counts',
+                stepName: '前端触发强制刷新导出卡片统计',
+                status: refreshResult?.success ? 'done' : 'failed',
+                level: refreshResult?.success ? 'info' : 'warn',
+                message: refreshResult?.success ? '强制刷新请求已提交' : `强制刷新失败：${refreshResult?.error || '未知错误'}`
+              })
+            }).catch((error) => {
+              logFrontendDiag({
+                traceId: refreshTraceId,
+                stepId: 'frontend-force-refresh-content-session-counts',
+                stepName: '前端触发强制刷新导出卡片统计',
+                status: 'failed',
+                level: 'error',
+                message: '强制刷新请求异常',
+                data: { error: String(error) }
+              })
             })
+          } else {
+            contentSessionCountsForceRetryRef.current = 0
+            setHasSeededContentSessionCounts(true)
+          }
+          logFrontendDiag({
+            traceId,
+            stepId: 'frontend-load-content-session-counts',
+            stepName: '前端请求导出卡片统计',
+            status: 'done',
+            durationMs: Date.now() - startedAt,
+            message: '导出卡片统计请求完成',
+            data: {
+              totalSessions: next.totalSessions,
+              pendingMediaSessions: next.pendingMediaSessions,
+              refreshing: next.refreshing
+            }
           })
         } else {
-          contentSessionCountsForceRetryRef.current = 0
-          setHasSeededContentSessionCounts(true)
+          logFrontendDiag({
+            traceId,
+            level: 'warn',
+            stepId: 'frontend-load-content-session-counts',
+            stepName: '前端请求导出卡片统计',
+            status: 'failed',
+            durationMs: Date.now() - startedAt,
+            message: `导出卡片统计请求失败：${result?.error || '未知错误'}`
+          })
         }
+      } catch (error) {
+        console.error('加载导出内容会话统计失败:', error)
         logFrontendDiag({
           traceId,
-          stepId: 'frontend-load-content-session-counts',
-          stepName: '前端请求导出卡片统计',
-          status: 'done',
-          durationMs: Date.now() - startedAt,
-          message: '导出卡片统计请求完成',
-          data: {
-            totalSessions: next.totalSessions,
-            pendingMediaSessions: next.pendingMediaSessions,
-            refreshing: next.refreshing
-          }
-        })
-      } else {
-        logFrontendDiag({
-          traceId,
-          level: 'warn',
+          level: 'error',
           stepId: 'frontend-load-content-session-counts',
           stepName: '前端请求导出卡片统计',
           status: 'failed',
           durationMs: Date.now() - startedAt,
-          message: `导出卡片统计请求失败：${result?.error || '未知错误'}`
+          message: '导出卡片统计请求异常',
+          data: { error: String(error) }
         })
       }
-    } catch (error) {
-      console.error('加载导出内容会话统计失败:', error)
-      logFrontendDiag({
-        traceId,
-        level: 'error',
-        stepId: 'frontend-load-content-session-counts',
-        stepName: '前端请求导出卡片统计',
-        status: 'failed',
-        durationMs: Date.now() - startedAt,
-        message: '导出卡片统计请求异常',
-        data: { error: String(error) }
-      })
+    })()
+
+    contentSessionCountsInFlightRef.current = task
+    contentSessionCountsInFlightTraceRef.current = traceId
+    try {
+      await task
+    } finally {
+      if (contentSessionCountsInFlightRef.current === task) {
+        contentSessionCountsInFlightRef.current = null
+        contentSessionCountsInFlightTraceRef.current = ''
+      }
     }
   }, [logFrontendDiag])
 
