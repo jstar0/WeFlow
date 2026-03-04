@@ -160,30 +160,10 @@ export interface ElectronAPI {
       counts?: Record<string, number>
       error?: string
     }>
-    getExportContentSessionCounts: (options?: {
-      triggerRefresh?: boolean
-      forceRefresh?: boolean
-      traceId?: string
-    }) => Promise<{
-      success: boolean
-      data?: {
-        totalSessions: number
-        textSessions: number
-        voiceSessions: number
-        imageSessions: number
-        videoSessions: number
-        emojiSessions: number
-        pendingMediaSessions: number
-        updatedAt: number
-        refreshing: boolean
-      }
-      error?: string
-    }>
-    refreshExportContentSessionCounts: (options?: { forceRefresh?: boolean; traceId?: string }) => Promise<{
-      success: boolean
-      error?: string
-    }>
-    enrichSessionsContactInfo: (usernames: string[]) => Promise<{
+    enrichSessionsContactInfo: (
+      usernames: string[],
+      options?: { skipDisplayName?: boolean; onlyMissingAvatar?: boolean }
+    ) => Promise<{
       success: boolean
       contacts?: Record<string, { displayName?: string; avatarUrl?: string }>
       error?: string
@@ -736,7 +716,7 @@ export interface ElectronAPI {
     downloadImage: (payload: { url: string; key?: string | number }) => Promise<{ success: boolean; data?: any; contentType?: string; error?: string }>
     exportTimeline: (options: {
       outputDir: string
-      format: 'json' | 'html'
+      format: 'json' | 'html' | 'arkmejson'
       usernames?: string[]
       keyword?: string
       exportMedia?: boolean

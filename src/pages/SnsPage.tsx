@@ -60,7 +60,7 @@ export default function SnsPage() {
 
     // 导出相关状态
     const [showExportDialog, setShowExportDialog] = useState(false)
-    const [exportFormat, setExportFormat] = useState<'json' | 'html'>('html')
+    const [exportFormat, setExportFormat] = useState<'json' | 'html' | 'arkmejson'>('html')
     const [exportFolder, setExportFolder] = useState('')
     const [exportMedia, setExportMedia] = useState(false)
     const [exportDateRange, setExportDateRange] = useState<{ start: string; end: string }>({ start: '', end: '' })
@@ -879,6 +879,15 @@ export default function SnsPage() {
                                                 <FileJson size={20} />
                                                 <span>JSON</span>
                                                 <small>结构化数据</small>
+                                            </button>
+                                            <button
+                                                className={`format-option ${exportFormat === 'arkmejson' ? 'active' : ''}`}
+                                                onClick={() => setExportFormat('arkmejson')}
+                                                disabled={isExporting}
+                                            >
+                                                <FileJson size={20} />
+                                                <span>ArkmeJSON</span>
+                                                <small>结构化数据（含互动身份）</small>
                                             </button>
                                         </div>
                                     </div>

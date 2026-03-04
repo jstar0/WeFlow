@@ -51,6 +51,7 @@ type SessionLayout = 'shared' | 'per-session'
 type DisplayNamePreference = 'group-nickname' | 'remark' | 'nickname'
 
 type TextExportFormat = 'chatlab' | 'chatlab-jsonl' | 'json' | 'arkme-json' | 'html' | 'txt' | 'excel' | 'weclone' | 'sql'
+type SnsTimelineExportFormat = 'json' | 'html' | 'arkmejson'
 
 interface ExportOptions {
   format: TextExportFormat
@@ -110,7 +111,7 @@ interface ExportTaskPayload {
   contentType?: ContentType
   sessionNames: string[]
   snsOptions?: {
-    format: 'json' | 'html'
+    format: SnsTimelineExportFormat
     exportMedia?: boolean
     startTime?: number
     endTime?: number
@@ -466,7 +467,6 @@ const createTaskId = (): string => `task-${Date.now()}-${Math.random().toString(
 const createExportDiagTraceId = (): string => `export-card-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
 const CONTACT_ENRICH_TIMEOUT_MS = 7000
 const EXPORT_SNS_STATS_CACHE_STALE_MS = 12 * 60 * 60 * 1000
-const EXPORT_AVATAR_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
 const EXPORT_AVATAR_ENRICH_BATCH_SIZE = 80
 const CONTACTS_LIST_VIRTUAL_ROW_HEIGHT = 76
 const CONTACTS_LIST_VIRTUAL_OVERSCAN = 10
@@ -541,18 +541,6 @@ interface SessionExportCacheMeta {
   source: 'memory' | 'disk' | 'fresh'
 }
 
-interface ExportContentSessionCountsSummary {
-  totalSessions: number
-  textSessions: number
-  voiceSessions: number
-  imageSessions: number
-  videoSessions: number
-  emojiSessions: number
-  pendingMediaSessions: number
-  updatedAt: number
-  refreshing: boolean
-}
-
 type ExportCardDiagFilter = 'all' | 'frontend' | 'main' | 'backend' | 'worker' | 'warn' | 'error'
 
 type ExportCardDiagSource = 'frontend' | 'main' | 'backend' | 'worker'
@@ -596,18 +584,6 @@ interface ExportCardDiagSnapshotState {
     timeoutCount: number
     lastUpdatedAt: number
   }
-}
-
-const defaultContentSessionCounts: ExportContentSessionCountsSummary = {
-  totalSessions: 0,
-  textSessions: 0,
-  voiceSessions: 0,
-  imageSessions: 0,
-  videoSessions: 0,
-  emojiSessions: 0,
-  pendingMediaSessions: 0,
-  updatedAt: 0,
-  refreshing: false
 }
 
 const defaultExportCardDiagSnapshot: ExportCardDiagSnapshotState = {
@@ -888,7 +864,8 @@ function ExportPage() {
   const [contactsAvatarEnrichProgress, setContactsAvatarEnrichProgress] = useState({
     loaded: 0,
     total: 0,
-    running: false
+    running: false,
+    tab: null as ConversationTab | null
   })
   const [showSessionDetailPanel, setShowSessionDetailPanel] = useState(false)
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
@@ -900,6 +877,7 @@ function ExportPage() {
 
   const [exportFolder, setExportFolder] = useState('')
   const [writeLayout, setWriteLayout] = useState<configService.ExportWriteLayout>('A')
+  const [snsExportFormat, setSnsExportFormat] = useState<SnsTimelineExportFormat>('html')
 
   const [options, setOptions] = useState<ExportOptions>({
     format: 'arkme-json',
@@ -937,8 +915,6 @@ function ExportPage() {
     totalPosts: 0,
     totalFriends: 0
   })
-  const [contentSessionCounts, setContentSessionCounts] = useState<ExportContentSessionCountsSummary>(defaultContentSessionCounts)
-  const [hasSeededContentSessionCounts, setHasSeededContentSessionCounts] = useState(false)
   const [hasSeededSnsStats, setHasSeededSnsStats] = useState(false)
   const [showCardDiagnostics, setShowCardDiagnostics] = useState(false)
   const [diagFilter, setDiagFilter] = useState<ExportCardDiagFilter>('all')
@@ -960,6 +936,8 @@ function ExportPage() {
   const preselectAppliedRef = useRef(false)
   const exportCacheScopeRef = useRef('default')
   const exportCacheScopeReadyRef = useRef(false)
+  const activeTabRef = useRef<ConversationTab>('private')
+  const contactsDataRef = useRef<ContactInfo[]>([])
   const contactsLoadVersionRef = useRef(0)
   const contactsLoadAttemptRef = useRef(0)
   const contactsLoadTimeoutTimerRef = useRef<number | null>(null)
@@ -970,9 +948,6 @@ function ExportPage() {
   const inProgressSessionIdsRef = useRef<string[]>([])
   const activeTaskCountRef = useRef(0)
   const hasBaseConfigReadyRef = useRef(false)
-  const contentSessionCountsForceRetryRef = useRef(0)
-  const contentSessionCountsInFlightRef = useRef<Promise<void> | null>(null)
-  const contentSessionCountsInFlightTraceRef = useRef('')
 
   const appendFrontendDiagLog = useCallback((entry: ExportCardDiagLogEntry) => {
     setFrontendDiagLogs(prev => {
@@ -1079,6 +1054,14 @@ function ExportPage() {
     contactsLoadTimeoutMsRef.current = contactsLoadTimeoutMs
   }, [contactsLoadTimeoutMs])
 
+  useEffect(() => {
+    activeTabRef.current = activeTab
+  }, [activeTab])
+
+  useEffect(() => {
+    contactsDataRef.current = contactsList
+  }, [contactsList])
+
   const applyEnrichedContactsToList = useCallback((enrichedMap: Record<string, { displayName?: string; avatarUrl?: string }>) => {
     if (!enrichedMap || Object.keys(enrichedMap).length === 0) return
     setContactsList(prev => {
@@ -1105,7 +1088,8 @@ function ExportPage() {
   const enrichContactsListInBackground = useCallback(async (
     sourceContacts: ContactInfo[],
     loadVersion: number,
-    scopeKey: string
+    scopeKey: string,
+    targetTab: ConversationTab
   ) => {
     const sourceByUsername = new Map<string, ContactInfo>()
     for (const contact of sourceContacts) {
@@ -1113,29 +1097,21 @@ function ExportPage() {
       sourceByUsername.set(contact.username, contact)
     }
 
-    const now = Date.now()
-    const usernames = sourceContacts
+    const usernames = Array.from(new Set(sourceContacts
+      .filter(contact => matchesContactTab(contact, targetTab))
       .map(contact => contact.username)
       .filter(Boolean)
       .filter((username) => {
         const currentContact = sourceByUsername.get(username)
-        if (!currentContact) return false
-        const cacheEntry = contactsAvatarCacheRef.current[username]
-        if (!cacheEntry || !cacheEntry.avatarUrl) {
-          return !currentContact.avatarUrl
-        }
-        if (currentContact.avatarUrl && currentContact.avatarUrl !== cacheEntry.avatarUrl) {
-          return true
-        }
-        const checkedAt = cacheEntry.checkedAt || 0
-        return now - checkedAt >= EXPORT_AVATAR_RECHECK_INTERVAL_MS
-      })
+        return Boolean(currentContact && !currentContact.avatarUrl)
+      })))
 
     const total = usernames.length
     setContactsAvatarEnrichProgress({
       loaded: 0,
       total,
-      running: total > 0
+      running: total > 0,
+      tab: targetTab
     })
     if (total === 0) return
 
@@ -1145,9 +1121,15 @@ function ExportPage() {
       if (batch.length === 0) continue
 
       try {
-        const avatarResult = await window.electronAPI.chat.enrichSessionsContactInfo(batch)
+        const avatarResult = await withTimeout(
+          window.electronAPI.chat.enrichSessionsContactInfo(batch, {
+            skipDisplayName: true,
+            onlyMissingAvatar: true
+          }),
+          CONTACT_ENRICH_TIMEOUT_MS
+        )
         if (contactsLoadVersionRef.current !== loadVersion) return
-        if (avatarResult.success && avatarResult.contacts) {
+        if (avatarResult?.success && avatarResult.contacts) {
           applyEnrichedContactsToList(avatarResult.contacts)
           for (const [username, enriched] of Object.entries(avatarResult.contacts)) {
             const prev = sourceByUsername.get(username)
@@ -1180,7 +1162,8 @@ function ExportPage() {
       setContactsAvatarEnrichProgress({
         loaded,
         total,
-        running: loaded < total
+        running: loaded < total,
+        tab: targetTab
       })
       await new Promise(resolve => setTimeout(resolve, 0))
     }
@@ -1192,6 +1175,7 @@ function ExportPage() {
 
   const loadContactsList = useCallback(async (options?: { scopeKey?: string }) => {
     const scopeKey = options?.scopeKey || await ensureExportCacheScope()
+    const targetTab = activeTabRef.current
     const loadVersion = contactsLoadVersionRef.current + 1
     contactsLoadVersionRef.current = loadVersion
     contactsLoadAttemptRef.current += 1
@@ -1228,7 +1212,8 @@ function ExportPage() {
     setContactsAvatarEnrichProgress({
       loaded: 0,
       total: 0,
-      running: false
+      running: false,
+      tab: null
     })
 
     try {
@@ -1276,7 +1261,7 @@ function ExportPage() {
         ).catch((error) => {
           console.error('写入导出页通讯录缓存失败:', error)
         })
-        void enrichContactsListInBackground(contactsWithAvatarCache, loadVersion, scopeKey)
+        void enrichContactsListInBackground(contactsWithAvatarCache, loadVersion, scopeKey, targetTab)
         return
       }
 
@@ -1352,12 +1337,27 @@ function ExportPage() {
   }, [isExportRoute, ensureExportCacheScope, loadContactsList, syncContactTypeCounts])
 
   useEffect(() => {
+    if (!isExportRoute || isContactsListLoading || contactsDataRef.current.length === 0) return
+    let cancelled = false
+    const loadVersion = contactsLoadVersionRef.current
+    void (async () => {
+      const scopeKey = await ensureExportCacheScope()
+      if (cancelled || contactsLoadVersionRef.current !== loadVersion) return
+      await enrichContactsListInBackground(contactsDataRef.current, loadVersion, scopeKey, activeTab)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [activeTab, ensureExportCacheScope, enrichContactsListInBackground, isContactsListLoading, isExportRoute])
+
+  useEffect(() => {
     if (isExportRoute) return
     contactsLoadVersionRef.current += 1
     setContactsAvatarEnrichProgress({
       loaded: 0,
       total: 0,
-      running: false
+      running: false,
+      tab: null
     })
   }, [isExportRoute])
 
@@ -1538,163 +1538,6 @@ function ExportPage() {
     }
   }, [])
 
-  const loadContentSessionCounts = useCallback(async (options?: { silent?: boolean; forceRefresh?: boolean }) => {
-    if (contentSessionCountsInFlightRef.current) {
-      logFrontendDiag({
-        level: 'info',
-        stepId: 'frontend-load-content-session-counts',
-        stepName: '前端请求导出卡片统计',
-        status: 'running',
-        message: '统计请求仍在进行中，跳过本次轮询',
-        data: {
-          silent: options?.silent === true,
-          forceRefresh: options?.forceRefresh === true,
-          inFlightTraceId: contentSessionCountsInFlightTraceRef.current || undefined
-        }
-      })
-      return
-    }
-
-    const traceId = createExportDiagTraceId()
-    const startedAt = Date.now()
-    const task = (async () => {
-      logFrontendDiag({
-        traceId,
-        stepId: 'frontend-load-content-session-counts',
-        stepName: '前端请求导出卡片统计',
-        status: 'running',
-        message: '开始请求导出卡片统计',
-        data: {
-          silent: options?.silent === true,
-          forceRefresh: options?.forceRefresh === true
-        }
-      })
-      try {
-        const result = await withTimeout(
-          window.electronAPI.chat.getExportContentSessionCounts({
-            triggerRefresh: true,
-            forceRefresh: options?.forceRefresh === true,
-            traceId
-          }),
-          3200
-        )
-        if (!result) {
-          logFrontendDiag({
-            traceId,
-            level: 'warn',
-            stepId: 'frontend-load-content-session-counts',
-            stepName: '前端请求导出卡片统计',
-            status: 'timeout',
-            durationMs: Date.now() - startedAt,
-            message: '导出卡片统计请求超时（3200ms，后台可能仍在处理）'
-          })
-          return
-        }
-        if (result?.success && result.data) {
-          const next: ExportContentSessionCountsSummary = {
-            totalSessions: Number.isFinite(result.data.totalSessions) ? Math.max(0, Math.floor(result.data.totalSessions)) : 0,
-            textSessions: Number.isFinite(result.data.textSessions) ? Math.max(0, Math.floor(result.data.textSessions)) : 0,
-            voiceSessions: Number.isFinite(result.data.voiceSessions) ? Math.max(0, Math.floor(result.data.voiceSessions)) : 0,
-            imageSessions: Number.isFinite(result.data.imageSessions) ? Math.max(0, Math.floor(result.data.imageSessions)) : 0,
-            videoSessions: Number.isFinite(result.data.videoSessions) ? Math.max(0, Math.floor(result.data.videoSessions)) : 0,
-            emojiSessions: Number.isFinite(result.data.emojiSessions) ? Math.max(0, Math.floor(result.data.emojiSessions)) : 0,
-            pendingMediaSessions: Number.isFinite(result.data.pendingMediaSessions) ? Math.max(0, Math.floor(result.data.pendingMediaSessions)) : 0,
-            updatedAt: Number.isFinite(result.data.updatedAt) ? Math.max(0, Math.floor(result.data.updatedAt)) : 0,
-            refreshing: result.data.refreshing === true
-          }
-          setContentSessionCounts(next)
-          const looksLikeAllZero = next.totalSessions > 0 &&
-            next.textSessions === 0 &&
-            next.voiceSessions === 0 &&
-            next.imageSessions === 0 &&
-            next.videoSessions === 0 &&
-            next.emojiSessions === 0
-
-          if (looksLikeAllZero && contentSessionCountsForceRetryRef.current < 3) {
-            contentSessionCountsForceRetryRef.current += 1
-            const refreshTraceId = createExportDiagTraceId()
-            logFrontendDiag({
-              traceId: refreshTraceId,
-              stepId: 'frontend-force-refresh-content-session-counts',
-              stepName: '前端触发强制刷新导出卡片统计',
-              status: 'running',
-              message: '检测到统计全0，触发强制刷新'
-            })
-            void window.electronAPI.chat.refreshExportContentSessionCounts({ forceRefresh: true, traceId: refreshTraceId }).then((refreshResult) => {
-              logFrontendDiag({
-                traceId: refreshTraceId,
-                stepId: 'frontend-force-refresh-content-session-counts',
-                stepName: '前端触发强制刷新导出卡片统计',
-                status: refreshResult?.success ? 'done' : 'failed',
-                level: refreshResult?.success ? 'info' : 'warn',
-                message: refreshResult?.success ? '强制刷新请求已提交' : `强制刷新失败：${refreshResult?.error || '未知错误'}`
-              })
-            }).catch((error) => {
-              logFrontendDiag({
-                traceId: refreshTraceId,
-                stepId: 'frontend-force-refresh-content-session-counts',
-                stepName: '前端触发强制刷新导出卡片统计',
-                status: 'failed',
-                level: 'error',
-                message: '强制刷新请求异常',
-                data: { error: String(error) }
-              })
-            })
-          } else {
-            contentSessionCountsForceRetryRef.current = 0
-            setHasSeededContentSessionCounts(true)
-          }
-          logFrontendDiag({
-            traceId,
-            stepId: 'frontend-load-content-session-counts',
-            stepName: '前端请求导出卡片统计',
-            status: 'done',
-            durationMs: Date.now() - startedAt,
-            message: '导出卡片统计请求完成',
-            data: {
-              totalSessions: next.totalSessions,
-              pendingMediaSessions: next.pendingMediaSessions,
-              refreshing: next.refreshing
-            }
-          })
-        } else {
-          logFrontendDiag({
-            traceId,
-            level: 'warn',
-            stepId: 'frontend-load-content-session-counts',
-            stepName: '前端请求导出卡片统计',
-            status: 'failed',
-            durationMs: Date.now() - startedAt,
-            message: `导出卡片统计请求失败：${result?.error || '未知错误'}`
-          })
-        }
-      } catch (error) {
-        console.error('加载导出内容会话统计失败:', error)
-        logFrontendDiag({
-          traceId,
-          level: 'error',
-          stepId: 'frontend-load-content-session-counts',
-          stepName: '前端请求导出卡片统计',
-          status: 'failed',
-          durationMs: Date.now() - startedAt,
-          message: '导出卡片统计请求异常',
-          data: { error: String(error) }
-        })
-      }
-    })()
-
-    contentSessionCountsInFlightRef.current = task
-    contentSessionCountsInFlightTraceRef.current = traceId
-    try {
-      await task
-    } finally {
-      if (contentSessionCountsInFlightRef.current === task) {
-        contentSessionCountsInFlightRef.current = null
-        contentSessionCountsInFlightTraceRef.current = ''
-      }
-    }
-  }, [logFrontendDiag])
-
   const loadSessions = useCallback(async () => {
     const loadToken = Date.now()
     sessionLoadTokenRef.current = loadToken
@@ -1795,7 +1638,6 @@ function ExportPage() {
               if (!contact?.username) continue
               sourceByUsername.set(contact.username, contact)
             }
-            const now = Date.now()
             const rawSessionMap = rawSessions.reduce<Record<string, AppChatSession>>((map, session) => {
               map[session.username] = session
               return map
@@ -1807,17 +1649,9 @@ function ExportPage() {
               .filter(Boolean)
               .filter((username) => {
                 const currentContact = sourceByUsername.get(username)
-                const cacheEntry = avatarEntries[username]
                 const session = rawSessionMap[username]
                 const currentAvatarUrl = currentContact?.avatarUrl || session?.avatarUrl
-                if (!cacheEntry || !cacheEntry.avatarUrl) {
-                  return !currentAvatarUrl
-                }
-                if (currentAvatarUrl && currentAvatarUrl !== cacheEntry.avatarUrl) {
-                  return true
-                }
-                const checkedAt = cacheEntry.checkedAt || 0
-                return now - checkedAt >= EXPORT_AVATAR_RECHECK_INTERVAL_MS
+                return !currentAvatarUrl
               })
 
             let extraContactMap: Record<string, { displayName?: string; avatarUrl?: string }> = {}
@@ -1828,7 +1662,10 @@ function ExportPage() {
                 if (batch.length === 0) continue
                 try {
                   const enrichResult = await withTimeout(
-                    window.electronAPI.chat.enrichSessionsContactInfo(batch),
+                    window.electronAPI.chat.enrichSessionsContactInfo(batch, {
+                      skipDisplayName: true,
+                      onlyMissingAvatar: true
+                    }),
                     CONTACT_ENRICH_TIMEOUT_MS
                   )
                   if (isStale()) return
@@ -1941,7 +1778,6 @@ function ExportPage() {
     void loadBaseConfig()
     void ensureSharedTabCountsLoaded()
     void loadSessions()
-    void loadContentSessionCounts()
 
     // 朋友圈统计延后一点加载，避免与首屏会话初始化抢占。
     const timer = window.setTimeout(() => {
@@ -1949,15 +1785,7 @@ function ExportPage() {
     }, 120)
 
     return () => window.clearTimeout(timer)
-  }, [isExportRoute, ensureSharedTabCountsLoaded, loadBaseConfig, loadSessions, loadSnsStats, loadContentSessionCounts])
-
-  useEffect(() => {
-    if (!isExportRoute) return
-    const timer = window.setInterval(() => {
-      void loadContentSessionCounts({ silent: true })
-    }, 3000)
-    return () => window.clearInterval(timer)
-  }, [isExportRoute, loadContentSessionCounts])
+  }, [isExportRoute, ensureSharedTabCountsLoaded, loadBaseConfig, loadSessions, loadSnsStats])
 
   useEffect(() => {
     if (!isExportRoute || !showCardDiagnostics) return
@@ -2066,7 +1894,6 @@ function ExportPage() {
       }
 
       if (payload.scope === 'sns') {
-        next.format = prev.format === 'json' || prev.format === 'html' ? prev.format : 'html'
         return next
       }
 
@@ -2210,7 +2037,7 @@ function ExportPage() {
   }
 
   const buildSnsExportOptions = () => {
-    const format: 'json' | 'html' = options.format === 'json' ? 'json' : 'html'
+    const format: SnsTimelineExportFormat = snsExportFormat
     const exportMediaEnabled = Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
     const dateRange = options.useAllTime
       ? null
@@ -2332,7 +2159,7 @@ function ExportPage() {
 
     try {
       if (next.payload.scope === 'sns') {
-        const snsOptions = next.payload.snsOptions || { format: 'html' as const, exportMedia: false }
+        const snsOptions = next.payload.snsOptions || { format: 'html' as SnsTimelineExportFormat, exportMedia: false }
         const result = await window.electronAPI.sns.exportTimeline({
           outputDir: next.payload.outputDir,
           format: snsOptions.format,
@@ -2830,13 +2657,6 @@ function ExportPage() {
   const contentCards = useMemo(() => {
     const scopeSessions = sessions.filter(isContentScopeSession)
     const snsExportedCount = Math.min(lastSnsExportPostCount, snsStats.totalPosts)
-    const contentSessionCountByType: Record<ContentType, number> = {
-      text: contentSessionCounts.textSessions,
-      voice: contentSessionCounts.voiceSessions,
-      image: contentSessionCounts.imageSessions,
-      video: contentSessionCounts.videoSessions,
-      emoji: contentSessionCounts.emojiSessions
-    }
 
     const sessionCards = [
       { type: 'text' as ContentType, icon: MessageSquareText },
@@ -2856,7 +2676,6 @@ function ExportPage() {
         ...item,
         label: contentTypeLabels[item.type],
         stats: [
-          { label: '可导出会话数', value: contentSessionCountByType[item.type] || 0 },
           { label: '已导出', value: exported }
         ]
       }
@@ -2873,7 +2692,7 @@ function ExportPage() {
     }
 
     return [...sessionCards, snsCard]
-  }, [sessions, contentSessionCounts, lastExportByContent, snsStats, lastSnsExportPostCount])
+  }, [sessions, lastExportByContent, snsStats, lastSnsExportPostCount])
 
   const mergedCardDiagLogs = useMemo(() => {
     const merged = [...backendDiagSnapshot.logs, ...frontendDiagLogs]
@@ -3376,6 +3195,7 @@ function ExportPage() {
       contact.avatarUrl ? count + 1 : count
     ), 0)
   }, [contactsList])
+  const isCurrentTabAvatarEnrichRunning = contactsAvatarEnrichProgress.running && contactsAvatarEnrichProgress.tab === activeTab
 
   useEffect(() => {
     if (!contactsListRef.current) return
@@ -3598,16 +3418,19 @@ function ExportPage() {
   const scopeCountLabel = exportDialog.scope === 'sns'
     ? `共 ${snsStats.totalPosts} 条朋友圈动态`
     : `共 ${exportDialog.sessionIds.length} 个会话`
+  const snsFormatOptions: Array<{ value: SnsTimelineExportFormat; label: string; desc: string }> = [
+    { value: 'html', label: 'HTML', desc: '网页格式，可直接浏览' },
+    { value: 'json', label: 'JSON', desc: '原始结构化格式（兼容旧导入）' },
+    { value: 'arkmejson', label: 'ArkmeJSON', desc: '增强结构化格式，包含互动身份字段' }
+  ]
   const formatCandidateOptions = exportDialog.scope === 'sns'
-    ? formatOptions.filter(option => option.value === 'html' || option.value === 'json')
+    ? snsFormatOptions
     : formatOptions
   const isContentScopeDialog = exportDialog.scope === 'content'
   const isContentTextDialog = isContentScopeDialog && exportDialog.contentType === 'text'
   const shouldShowFormatSection = !isContentScopeDialog || isContentTextDialog
   const shouldShowMediaSection = !isContentScopeDialog
   const isTabCountComputing = isSharedTabCountsLoading && !isSharedTabCountsReady
-  const isSessionCardStatsLoading = isBaseConfigLoading || !hasSeededContentSessionCounts
-  const isSessionCardStatsRefreshing = contentSessionCounts.refreshing || contentSessionCounts.pendingMediaSessions > 0
   const isSnsCardStatsLoading = !hasSeededSnsStats
   const taskRunningCount = tasks.filter(task => task.status === 'running').length
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
@@ -3873,17 +3696,12 @@ function ExportPage() {
           const Icon = card.icon
           const isCardStatsLoading = card.type === 'sns'
             ? isSnsCardStatsLoading
-            : isSessionCardStatsLoading
+            : false
           const isCardRunning = runningCardTypes.has(card.type)
           return (
             <div key={card.type} className="content-card">
               <div className="card-header">
                 <div className="card-title"><Icon size={16} /> {card.label}</div>
-                {card.type !== 'sns' && !isCardStatsLoading && isSessionCardStatsRefreshing && (
-                  <span className="card-refresh-hint">
-                    刷新中<span className="animated-ellipsis" aria-hidden="true">...</span>
-                  </span>
-                )}
               </div>
               <div className="card-stats">
                 {card.stats.map((stat) => (
@@ -4112,17 +3930,17 @@ function ExportPage() {
               {avatarCacheUpdatedAtLabel ? ` · 更新于 ${avatarCacheUpdatedAtLabel}` : ''}
             </span>
           )}
-          {(isContactsListLoading || contactsAvatarEnrichProgress.running) && contactsList.length > 0 && (
+          {(isContactsListLoading || isCurrentTabAvatarEnrichRunning) && contactsList.length > 0 && (
             <span className="meta-item syncing">后台同步中...</span>
           )}
-          {contactsAvatarEnrichProgress.running && (
+          {isCurrentTabAvatarEnrichRunning && (
             <span className="meta-item syncing">
               头像补全中 {contactsAvatarEnrichProgress.loaded}/{contactsAvatarEnrichProgress.total}
             </span>
           )}
         </div>
 
-        {contactsList.length > 0 && (isContactsListLoading || contactsAvatarEnrichProgress.running) && (
+        {contactsList.length > 0 && (isContactsListLoading || isCurrentTabAvatarEnrichRunning) && (
           <div className="table-stage-hint">
             <Loader2 size={14} className="spin" />
             {isContactsListLoading ? '联系人列表同步中…' : '正在补充头像…'}
@@ -4513,7 +4331,7 @@ function ExportPage() {
 
               {shouldShowFormatSection && (
                 <div className="dialog-section">
-                  <h4>对话文本导出格式选择</h4>
+                  <h4>{exportDialog.scope === 'sns' ? '朋友圈导出格式选择' : '对话文本导出格式选择'}</h4>
                   {isContentTextDialog && (
                     <div className="format-note">说明：此模式默认导出头像，不导出图片、语音、视频、表情包等媒体内容。</div>
                   )}
@@ -4521,8 +4339,16 @@ function ExportPage() {
                     {formatCandidateOptions.map(option => (
                       <button
                         key={option.value}
-                        className={`format-card ${options.format === option.value ? 'active' : ''}`}
-                        onClick={() => setOptions(prev => ({ ...prev, format: option.value }))}
+                        className={`format-card ${exportDialog.scope === 'sns'
+                          ? (snsExportFormat === option.value ? 'active' : '')
+                          : (options.format === option.value ? 'active' : '')}`}
+                        onClick={() => {
+                          if (exportDialog.scope === 'sns') {
+                            setSnsExportFormat(option.value as SnsTimelineExportFormat)
+                          } else {
+                            setOptions(prev => ({ ...prev, format: option.value as TextExportFormat }))
+                          }
+                        }}
                       >
                         <div className="format-label">{option.label}</div>
                         <div className="format-desc">{option.desc}</div>

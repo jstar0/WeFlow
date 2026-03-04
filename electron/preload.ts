@@ -143,12 +143,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getExportTabCounts: () => ipcRenderer.invoke('chat:getExportTabCounts'),
     getContactTypeCounts: () => ipcRenderer.invoke('chat:getContactTypeCounts'),
     getSessionMessageCounts: (sessionIds: string[]) => ipcRenderer.invoke('chat:getSessionMessageCounts', sessionIds),
-    getExportContentSessionCounts: (options?: { triggerRefresh?: boolean; forceRefresh?: boolean }) =>
-      ipcRenderer.invoke('chat:getExportContentSessionCounts', options),
-    refreshExportContentSessionCounts: (options?: { forceRefresh?: boolean }) =>
-      ipcRenderer.invoke('chat:refreshExportContentSessionCounts', options),
-    enrichSessionsContactInfo: (usernames: string[]) =>
-      ipcRenderer.invoke('chat:enrichSessionsContactInfo', usernames),
+    enrichSessionsContactInfo: (
+      usernames: string[],
+      options?: { skipDisplayName?: boolean; onlyMissingAvatar?: boolean }
+    ) => ipcRenderer.invoke('chat:enrichSessionsContactInfo', usernames, options),
     getMessages: (sessionId: string, offset?: number, limit?: number, startTime?: number, endTime?: number, ascending?: boolean) =>
       ipcRenderer.invoke('chat:getMessages', sessionId, offset, limit, startTime, endTime, ascending),
     getLatestMessages: (sessionId: string, limit?: number) =>

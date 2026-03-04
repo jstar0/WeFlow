@@ -14,11 +14,6 @@ import { MessageCacheService } from './messageCacheService'
 import { ContactCacheService, ContactCacheEntry } from './contactCacheService'
 import { SessionStatsCacheService, SessionStatsCacheEntry, SessionStatsCacheStats } from './sessionStatsCacheService'
 import { GroupMyMessageCountCacheService, GroupMyMessageCountCacheEntry } from './groupMyMessageCountCacheService'
-import {
-  ExportContentScopeStatsEntry,
-  ExportContentSessionStatsEntry,
-  ExportContentStatsCacheService
-} from './exportContentStatsCacheService'
 import { exportCardDiagnosticsService } from './exportCardDiagnosticsService'
 import { voiceTranscribeService } from './voiceTranscribeService'
 import { LRUCache } from '../utils/LRUCache.js'
@@ -173,18 +168,6 @@ interface ExportSessionStatsCacheMeta {
   source: 'memory' | 'disk' | 'fresh'
 }
 
-interface ExportContentSessionCounts {
-  totalSessions: number
-  textSessions: number
-  voiceSessions: number
-  imageSessions: number
-  videoSessions: number
-  emojiSessions: number
-  pendingMediaSessions: number
-  updatedAt: number
-  refreshing: boolean
-}
-
 interface ExportTabCounts {
   private: number
   group: number
@@ -229,7 +212,6 @@ class ChatService {
   private readonly messageCacheService: MessageCacheService
   private readonly sessionStatsCacheService: SessionStatsCacheService
   private readonly groupMyMessageCountCacheService: GroupMyMessageCountCacheService
-  private readonly exportContentStatsCacheService: ExportContentStatsCacheService
   private voiceWavCache: LRUCache<string, Buffer>
   private voiceTranscriptCache: LRUCache<string, string>
   private voiceTranscriptPending = new Map<string, Promise<{ success: boolean; transcript?: string; error?: string }>>()
@@ -270,24 +252,6 @@ class ChatService {
   private readonly allGroupSessionIdsCacheTtlMs = 5 * 60 * 1000
   private groupMyMessageCountCacheScope = ''
   private groupMyMessageCountMemoryCache = new Map<string, GroupMyMessageCountCacheEntry>()
-  private exportContentStatsScope = ''
-  private exportContentStatsMemory = new Map<string, ExportContentSessionStatsEntry>()
-  private exportContentStatsScopeUpdatedAt = 0
-  private exportContentStatsRefreshPromise: Promise<void> | null = null
-  private exportContentStatsRefreshQueued = false
-  private exportContentStatsRefreshForceQueued = false
-  private exportContentTextRefreshPromise: Promise<void> | null = null
-  private exportContentTextRefreshQueued = false
-  private exportContentTextRefreshForceQueued = false
-  private exportContentSessionCountsInFlight: {
-    promise: Promise<{ success: boolean; data?: ExportContentSessionCounts; error?: string }>
-    forceRefresh: boolean
-    traceId: string
-    startedAt: number
-  } | null = null
-  private exportContentStatsDirtySessionIds = new Set<string>()
-  private exportContentScopeSessionIdsCache: { ids: string[]; updatedAt: number } | null = null
-  private readonly exportContentScopeSessionIdsCacheTtlMs = 60 * 1000
 
   constructor() {
     this.configService = new ConfigService()
@@ -297,7 +261,6 @@ class ChatService {
     this.messageCacheService = new MessageCacheService(this.configService.getCacheBasePath())
     this.sessionStatsCacheService = new SessionStatsCacheService(this.configService.getCacheBasePath())
     this.groupMyMessageCountCacheService = new GroupMyMessageCountCacheService(this.configService.getCacheBasePath())
-    this.exportContentStatsCacheService = new ExportContentStatsCacheService(this.configService.getCacheBasePath())
     // 初始化LRU缓存，限制大小防止内存泄漏
     this.voiceWavCache = new LRUCache(this.voiceWavCacheMaxEntries)
     this.voiceTranscriptCache = new LRUCache(1000) // 最多缓存1000条转写记录
@@ -368,10 +331,6 @@ class ChatService {
 
       // 预热 listMediaDbs 缓存（后台异步执行，不阻塞连接）
       this.warmupMediaDbsCache()
-      // 预热导出内容会话统计缓存（后台异步，不阻塞连接）
-      void this.startExportContentStatsRefresh(false).catch((error) => {
-        console.error('ChatService: 后台刷新导出内容统计失败:', error)
-      })
 
       return { success: true }
     } catch (e) {
@@ -440,14 +399,6 @@ class ChatService {
       console.error('ChatService: 关闭数据库失败:', e)
     }
     this.connected = false
-    this.exportContentStatsRefreshPromise = null
-    this.exportContentStatsRefreshQueued = false
-    this.exportContentStatsRefreshForceQueued = false
-    this.exportContentTextRefreshPromise = null
-    this.exportContentTextRefreshQueued = false
-    this.exportContentTextRefreshForceQueued = false
-    this.exportContentSessionCountsInFlight = null
-    this.exportContentScopeSessionIdsCache = null
   }
 
   /**
@@ -649,15 +600,27 @@ class ChatService {
   /**
    * 异步补充会话列表的联系人信息（公开方法，供前端调用）
    */
-  async enrichSessionsContactInfo(usernames: string[]): Promise<{
+  async enrichSessionsContactInfo(
+    usernames: string[],
+    options?: { skipDisplayName?: boolean; onlyMissingAvatar?: boolean }
+  ): Promise<{
     success: boolean
     contacts?: Record<string, { displayName?: string; avatarUrl?: string }>
     error?: string
   }> {
     try {
-      if (usernames.length === 0) {
+      const normalizedUsernames = Array.from(
+        new Set(
+          (usernames || [])
+            .map((username) => String(username || '').trim())
+            .filter(Boolean)
+        )
+      )
+      if (normalizedUsernames.length === 0) {
         return { success: true, contacts: {} }
       }
+      const skipDisplayName = options?.skipDisplayName === true
+      const onlyMissingAvatar = options?.onlyMissingAvatar === true
 
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) {
@@ -670,15 +633,23 @@ class ChatService {
       const updatedEntries: Record<string, ContactCacheEntry> = {}
 
       // 检查缓存
-      for (const username of usernames) {
+      for (const username of normalizedUsernames) {
         const cached = this.avatarCache.get(username)
+        const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
+        const cachedAvatarUrl = isValidAvatar ? cached?.avatarUrl : undefined
+        if (onlyMissingAvatar && cachedAvatarUrl) {
+          result[username] = {
+            displayName: skipDisplayName ? undefined : cached?.displayName,
+            avatarUrl: cachedAvatarUrl
+          }
+          continue
+        }
         // 如果缓存有效且有头像，直接使用；如果没有头像，也需要重新尝试获取
         // 额外检查：如果头像是无效的 hex 格式（以 ffd8 开头），也需要重新获取
-        const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
         if (cached && now - cached.updatedAt < this.avatarCacheTtlMs && isValidAvatar) {
           result[username] = {
-            displayName: cached.displayName,
-            avatarUrl: cached.avatarUrl
+            displayName: skipDisplayName ? undefined : cached.displayName,
+            avatarUrl: cachedAvatarUrl
           }
         } else {
           missing.push(username)
@@ -687,16 +658,19 @@ class ChatService {
 
       // 批量查询缺失的联系人信息
       if (missing.length > 0) {
-        const [displayNames, avatarUrls] = await Promise.all([
-          wcdbService.getDisplayNames(missing),
-          wcdbService.getAvatarUrls(missing)
-        ])
+        const displayNames = skipDisplayName
+          ? null
+          : await wcdbService.getDisplayNames(missing)
+        const avatarUrls = await wcdbService.getAvatarUrls(missing)
 
         // 收集没有头像 URL 的用户名
         const missingAvatars: string[] = []
 
         for (const username of missing) {
-          const displayName = displayNames.success && displayNames.map ? displayNames.map[username] : undefined
+          const previous = this.avatarCache.get(username)
+          const displayName = displayNames?.success && displayNames.map
+            ? displayNames.map[username]
+            : undefined
           let avatarUrl = avatarUrls.success && avatarUrls.map ? avatarUrls.map[username] : undefined
 
           // 如果没有头像 URL，记录下来稍后从 head_image.db 获取
@@ -705,11 +679,14 @@ class ChatService {
           }
 
           const cacheEntry: ContactCacheEntry = {
-            displayName: displayName || username,
+            displayName: displayName || previous?.displayName || username,
             avatarUrl,
             updatedAt: now
           }
-          result[username] = { displayName, avatarUrl }
+          result[username] = {
+            displayName: skipDisplayName ? undefined : (displayName || previous?.displayName),
+            avatarUrl
+          }
           // 更新缓存并记录持久化
           this.avatarCache.set(username, cacheEntry)
           updatedEntries[username] = cacheEntry
@@ -1770,7 +1747,6 @@ class ChatService {
     if (scope === this.sessionMessageCountCacheScope) {
       this.refreshSessionStatsCacheScope(scope)
       this.refreshGroupMyMessageCountCacheScope(scope)
-      this.refreshExportContentStatsScope(scope)
       return
     }
     this.sessionMessageCountCacheScope = scope
@@ -1781,787 +1757,12 @@ class ChatService {
     this.sessionStatusCache.clear()
     this.refreshSessionStatsCacheScope(scope)
     this.refreshGroupMyMessageCountCacheScope(scope)
-    this.refreshExportContentStatsScope(scope)
   }
 
   private refreshGroupMyMessageCountCacheScope(scope: string): void {
     if (scope === this.groupMyMessageCountCacheScope) return
     this.groupMyMessageCountCacheScope = scope
     this.groupMyMessageCountMemoryCache.clear()
-  }
-
-  private refreshExportContentStatsScope(scope: string): void {
-    if (scope === this.exportContentStatsScope) return
-    this.exportContentStatsScope = scope
-    this.exportContentStatsMemory.clear()
-    this.exportContentStatsDirtySessionIds.clear()
-    this.exportContentScopeSessionIdsCache = null
-    const scopeEntry = this.exportContentStatsCacheService.getScope(scope)
-    if (scopeEntry) {
-      this.exportContentStatsScopeUpdatedAt = scopeEntry.updatedAt
-      for (const [sessionId, entry] of Object.entries(scopeEntry.sessions)) {
-        this.exportContentStatsMemory.set(sessionId, { ...entry })
-      }
-      const snapshotIds = Object.keys(scopeEntry.sessions)
-        .map((sessionId) => String(sessionId || '').trim())
-        .filter(Boolean)
-        .filter((sessionId) => sessionId.endsWith('@chatroom') || !sessionId.startsWith('gh_'))
-      if (snapshotIds.length > 0) {
-        this.exportContentScopeSessionIdsCache = {
-          ids: snapshotIds,
-          updatedAt: Date.now()
-        }
-      }
-    } else {
-      this.exportContentStatsScopeUpdatedAt = 0
-    }
-  }
-
-  private persistExportContentStatsScope(validSessionIds?: Set<string>): void {
-    if (!this.exportContentStatsScope) return
-    const sessions: Record<string, ExportContentSessionStatsEntry> = {}
-    for (const [sessionId, entry] of this.exportContentStatsMemory.entries()) {
-      if (validSessionIds && !validSessionIds.has(sessionId)) continue
-      sessions[sessionId] = { ...entry }
-    }
-
-    const updatedAt = this.exportContentStatsScopeUpdatedAt || Date.now()
-    const scopeEntry: ExportContentScopeStatsEntry = {
-      updatedAt,
-      sessions
-    }
-    this.exportContentStatsCacheService.setScope(this.exportContentStatsScope, scopeEntry)
-  }
-
-  private async listExportContentScopeSessionIds(force = false, traceId?: string): Promise<string[]> {
-    const stepStartedAt = this.startExportDiagStep({
-      traceId,
-      stepId: 'backend-list-export-content-session-ids',
-      stepName: '列出导出内容会话范围',
-      message: '开始获取导出内容统计范围会话',
-      data: { force }
-    })
-    let success = false
-    let loadedCount = 0
-    let errorMessage = ''
-
-    const now = Date.now()
-    if (
-      !force &&
-      this.exportContentScopeSessionIdsCache &&
-      now - this.exportContentScopeSessionIdsCache.updatedAt <= this.exportContentScopeSessionIdsCacheTtlMs
-    ) {
-      success = true
-      loadedCount = this.exportContentScopeSessionIdsCache.ids.length
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-list-export-content-session-ids',
-        stepName: '列出导出内容会话范围',
-        startedAt: stepStartedAt,
-        success,
-        message: '命中会话范围缓存',
-        data: { count: loadedCount, fromCache: true }
-      })
-      return this.exportContentScopeSessionIdsCache.ids
-    }
-
-    if (!force && this.exportContentStatsMemory.size > 0) {
-      const ids = Array.from(this.exportContentStatsMemory.keys())
-        .map((sessionId) => String(sessionId || '').trim())
-        .filter(Boolean)
-        .filter((sessionId) => sessionId.endsWith('@chatroom') || !sessionId.startsWith('gh_'))
-      if (ids.length > 0) {
-        this.exportContentScopeSessionIdsCache = {
-          ids,
-          updatedAt: now
-        }
-        success = true
-        loadedCount = ids.length
-        this.endExportDiagStep({
-          traceId,
-          stepId: 'backend-list-export-content-session-ids',
-          stepName: '列出导出内容会话范围',
-          startedAt: stepStartedAt,
-          success,
-          message: '命中持久化会话范围快照',
-          data: { count: loadedCount, fromCache: true, fromSnapshot: true }
-        })
-        return ids
-      }
-    }
-
-    try {
-      const sessionsResult = await this.getSessions()
-      if (!sessionsResult.success || !sessionsResult.sessions) {
-        errorMessage = sessionsResult.error || '获取会话失败'
-        return []
-      }
-
-      const ids = Array.from(
-        new Set(
-          sessionsResult.sessions
-            .map((session) => String(session.username || '').trim())
-            .filter(Boolean)
-            .filter((sessionId) => sessionId.endsWith('@chatroom') || !sessionId.startsWith('gh_'))
-        )
-      )
-
-      this.exportContentScopeSessionIdsCache = {
-        ids,
-        updatedAt: now
-      }
-      success = true
-      loadedCount = ids.length
-      return ids
-    } catch (error) {
-      errorMessage = String(error)
-      return []
-    } finally {
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-list-export-content-session-ids',
-        stepName: '列出导出内容会话范围',
-        startedAt: stepStartedAt,
-        success,
-        message: success ? '导出内容会话范围获取完成' : '导出内容会话范围获取失败',
-        data: success ? { count: loadedCount, fromCache: false } : { error: errorMessage || '未知错误' }
-      })
-    }
-  }
-
-  private createDefaultExportContentEntry(): ExportContentSessionStatsEntry {
-    return {
-      updatedAt: 0,
-      hasAny: false,
-      hasVoice: false,
-      hasImage: false,
-      hasVideo: false,
-      hasEmoji: false,
-      mediaReady: false
-    }
-  }
-
-  private isExportContentEntryDirty(sessionId: string): boolean {
-    return this.exportContentStatsDirtySessionIds.has(sessionId)
-  }
-
-  private buildExportContentSessionCountsSnapshot(
-    sessionIds: string[],
-    options?: { forceRefresh?: boolean }
-  ): {
-    counts: ExportContentSessionCounts
-    missingTextCountSessionIds: string[]
-    pendingMediaSessionSet: Set<string>
-  } {
-    const forceRefresh = options?.forceRefresh === true
-    const sessionIdSet = new Set(sessionIds)
-
-    for (const sessionId of Array.from(this.exportContentStatsMemory.keys())) {
-      if (!sessionIdSet.has(sessionId)) {
-        this.exportContentStatsMemory.delete(sessionId)
-        this.exportContentStatsDirtySessionIds.delete(sessionId)
-      }
-    }
-
-    const missingTextCountSessionIds: string[] = []
-    let textSessions = 0
-    let voiceSessions = 0
-    let imageSessions = 0
-    let videoSessions = 0
-    let emojiSessions = 0
-    const pendingMediaSessionSet = new Set<string>()
-
-    for (const sessionId of sessionIds) {
-      const entry = this.exportContentStatsMemory.get(sessionId)
-      const hasKnownTextCount = Boolean(entry && entry.updatedAt > 0)
-
-      if (entry?.hasAny) {
-        textSessions += 1
-      }
-
-      if (forceRefresh || !entry || this.isExportContentEntryDirty(sessionId) || !hasKnownTextCount) {
-        missingTextCountSessionIds.push(sessionId)
-      }
-
-      const hasMediaSnapshot = Boolean(entry && entry.mediaReady)
-      if (hasMediaSnapshot && entry) {
-        if (entry.hasVoice) voiceSessions += 1
-        if (entry.hasImage) imageSessions += 1
-        if (entry.hasVideo) videoSessions += 1
-        if (entry.hasEmoji) emojiSessions += 1
-      } else {
-        pendingMediaSessionSet.add(sessionId)
-      }
-
-      if (this.isExportContentEntryDirty(sessionId) && hasMediaSnapshot) {
-        pendingMediaSessionSet.add(sessionId)
-      }
-    }
-
-    return {
-      counts: {
-        totalSessions: sessionIds.length,
-        textSessions,
-        voiceSessions,
-        imageSessions,
-        videoSessions,
-        emojiSessions,
-        pendingMediaSessions: pendingMediaSessionSet.size,
-        updatedAt: this.exportContentStatsScopeUpdatedAt,
-        refreshing: this.exportContentStatsRefreshPromise !== null || this.exportContentTextRefreshPromise !== null
-      },
-      missingTextCountSessionIds,
-      pendingMediaSessionSet
-    }
-  }
-
-  private async startExportContentTextCountsRefresh(
-    force = false,
-    traceId?: string,
-    sessionIdsHint?: string[]
-  ): Promise<void> {
-    const refreshStartedAt = this.startExportDiagStep({
-      traceId,
-      stepId: 'backend-fill-text-counts',
-      stepName: '补全文本会话计数',
-      message: '开始补全文本会话计数',
-      data: { force, hintSessions: Array.isArray(sessionIdsHint) ? sessionIdsHint.length : 0 }
-    })
-
-    if (this.exportContentTextRefreshPromise) {
-      this.exportContentTextRefreshQueued = true
-      this.exportContentTextRefreshForceQueued = this.exportContentTextRefreshForceQueued || force
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-fill-text-counts',
-        stepName: '补全文本会话计数',
-        startedAt: refreshStartedAt,
-        success: true,
-        message: '复用进行中的文本会话补全任务',
-        data: { queued: true, forceQueued: this.exportContentTextRefreshForceQueued }
-      })
-      return this.exportContentTextRefreshPromise
-    }
-
-    const task = (async () => {
-      const sessionIds = Array.isArray(sessionIdsHint) && sessionIdsHint.length > 0
-        ? sessionIdsHint
-        : await this.listExportContentScopeSessionIds(force, traceId)
-      if (sessionIds.length === 0) return
-
-      const snapshot = this.buildExportContentSessionCountsSnapshot(sessionIds, { forceRefresh: force })
-      const targets = snapshot.missingTextCountSessionIds
-      if (targets.length === 0) return
-
-      const stallStartedAt = Date.now()
-      const textCountStallTimer = setTimeout(() => {
-        this.logExportDiag({
-          traceId,
-          source: 'backend',
-          level: 'warn',
-          message: '补全文本会话计数耗时较长',
-          stepId: 'backend-fill-text-counts',
-          stepName: '补全文本会话计数',
-          status: 'running',
-          data: {
-            elapsedMs: Date.now() - stallStartedAt,
-            missingSessions: targets.length
-          }
-        })
-      }, 3000)
-
-      try {
-        const textCountResult = await this.getSessionMessageCounts(targets, {
-          preferHintCache: false,
-          bypassSessionCache: true,
-          traceId
-        })
-        if (!textCountResult.success || !textCountResult.counts) {
-          throw new Error(textCountResult.error || '文本会话计数补全失败')
-        }
-
-        const now = Date.now()
-        for (const sessionId of targets) {
-          const count = textCountResult.counts[sessionId]
-          const hasAny = Number.isFinite(count) && Number(count) > 0
-          const prevEntry = this.exportContentStatsMemory.get(sessionId) || this.createDefaultExportContentEntry()
-          this.exportContentStatsMemory.set(sessionId, {
-            ...prevEntry,
-            hasAny,
-            updatedAt: now
-          })
-        }
-        this.exportContentStatsScopeUpdatedAt = now
-        this.persistExportContentStatsScope(new Set(sessionIds))
-      } finally {
-        clearTimeout(textCountStallTimer)
-      }
-    })()
-
-    this.exportContentTextRefreshPromise = task
-    try {
-      await task
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-fill-text-counts',
-        stepName: '补全文本会话计数',
-        startedAt: refreshStartedAt,
-        success: true,
-        message: '文本会话计数补全完成'
-      })
-    } catch (error) {
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-fill-text-counts',
-        stepName: '补全文本会话计数',
-        startedAt: refreshStartedAt,
-        success: false,
-        message: '文本会话计数补全失败',
-        data: { error: String(error) }
-      })
-      throw error
-    } finally {
-      this.exportContentTextRefreshPromise = null
-      if (this.exportContentTextRefreshQueued) {
-        const rerunForce = this.exportContentTextRefreshForceQueued
-        this.exportContentTextRefreshQueued = false
-        this.exportContentTextRefreshForceQueued = false
-        void this.startExportContentTextCountsRefresh(rerunForce, traceId).catch((error) => {
-          console.error('ChatService: 重新触发文本会话计数补全失败:', error)
-        })
-      }
-    }
-  }
-
-  private async collectExportContentEntry(sessionId: string, traceId?: string): Promise<ExportContentSessionStatsEntry> {
-    const stepStartedAt = this.startExportDiagStep({
-      traceId,
-      stepId: 'backend-collect-export-content-entry',
-      stepName: '扫描单会话内容类型',
-      message: '开始扫描会话内容类型',
-      data: { sessionId }
-    })
-    let fallback = false
-    const entry = this.createDefaultExportContentEntry()
-    const cursorResult = await wcdbService.openMessageCursorLite(sessionId, 400, false, 0, 0)
-    if (!cursorResult.success || !cursorResult.cursor) {
-      fallback = true
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-collect-export-content-entry',
-        stepName: '扫描单会话内容类型',
-        startedAt: stepStartedAt,
-        success: false,
-        message: '会话内容扫描失败，游标未创建',
-        data: { sessionId, error: cursorResult.error || 'openMessageCursorLite failed' }
-      })
-      return {
-        ...entry,
-        updatedAt: Date.now(),
-        mediaReady: false
-      }
-    }
-
-    const cursor = cursorResult.cursor
-    try {
-      try {
-        let done = false
-        while (!done) {
-          const batch = await wcdbService.fetchMessageBatch(cursor)
-          if (!batch.success) {
-            break
-          }
-          const rows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
-          for (const row of rows) {
-            entry.hasAny = true
-            const localType = this.getRowInt(
-              row,
-              ['local_type', 'localType', 'type', 'msg_type', 'msgType', 'WCDB_CT_local_type'],
-              1
-            )
-            if (localType === 34) entry.hasVoice = true
-            if (localType === 3) entry.hasImage = true
-            if (localType === 43) entry.hasVideo = true
-            if (localType === 47) entry.hasEmoji = true
-
-            if (entry.hasVoice && entry.hasImage && entry.hasVideo && entry.hasEmoji) {
-              done = true
-              break
-            }
-          }
-
-          if (!batch.hasMore || rows.length === 0) {
-            break
-          }
-        }
-      } catch (error) {
-        this.endExportDiagStep({
-          traceId,
-          stepId: 'backend-collect-export-content-entry',
-          stepName: '扫描单会话内容类型',
-          startedAt: stepStartedAt,
-          success: false,
-          message: '会话内容扫描异常',
-          data: { sessionId, error: String(error) }
-        })
-        throw error
-      }
-
-      entry.mediaReady = true
-      entry.updatedAt = Date.now()
-      if (!fallback) {
-        this.endExportDiagStep({
-          traceId,
-          stepId: 'backend-collect-export-content-entry',
-          stepName: '扫描单会话内容类型',
-          startedAt: stepStartedAt,
-          success: true,
-          message: '会话内容扫描完成',
-          data: {
-            sessionId,
-            hasAny: entry.hasAny,
-            hasVoice: entry.hasVoice,
-            hasImage: entry.hasImage,
-            hasVideo: entry.hasVideo,
-            hasEmoji: entry.hasEmoji
-          }
-        })
-      }
-      return entry
-    } finally {
-      await wcdbService.closeMessageCursor(cursor)
-    }
-  }
-
-  private async startExportContentStatsRefresh(force = false, traceId?: string): Promise<void> {
-    const refreshStartedAt = this.startExportDiagStep({
-      traceId,
-      stepId: 'backend-refresh-export-content-stats',
-      stepName: '后台刷新导出内容统计',
-      message: '开始后台刷新导出内容会话统计',
-      data: { force }
-    })
-
-    if (this.exportContentStatsRefreshPromise) {
-      this.exportContentStatsRefreshQueued = true
-      this.exportContentStatsRefreshForceQueued = this.exportContentStatsRefreshForceQueued || force
-      this.logExportDiag({
-        traceId,
-        level: 'debug',
-        source: 'backend',
-        message: '已有刷新任务在执行，已加入队列',
-        stepId: 'backend-refresh-export-content-stats',
-        stepName: '后台刷新导出内容统计',
-        status: 'running',
-        data: { forceQueued: this.exportContentStatsRefreshForceQueued }
-      })
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-refresh-export-content-stats',
-        stepName: '后台刷新导出内容统计',
-        startedAt: refreshStartedAt,
-        success: true,
-        message: '复用进行中的后台刷新任务',
-        data: { queued: true, forceQueued: this.exportContentStatsRefreshForceQueued }
-      })
-      return this.exportContentStatsRefreshPromise
-    }
-
-    const task = (async () => {
-      const sessionIds = await this.listExportContentScopeSessionIds(force, traceId)
-      const sessionIdSet = new Set(sessionIds)
-      const targets: string[] = []
-
-      for (const sessionId of sessionIds) {
-        const cached = this.exportContentStatsMemory.get(sessionId)
-        if (force || this.exportContentStatsDirtySessionIds.has(sessionId) || !cached || !cached.mediaReady) {
-          targets.push(sessionId)
-        }
-      }
-
-      if (targets.length > 0) {
-        this.logExportDiag({
-          traceId,
-          source: 'backend',
-          level: 'info',
-          message: '准备刷新导出内容会话统计目标',
-          stepId: 'backend-refresh-export-content-stats',
-          stepName: '后台刷新导出内容统计',
-          status: 'running',
-          data: {
-            totalSessions: sessionIds.length,
-            targetSessions: targets.length
-          }
-        })
-        await this.forEachWithConcurrency(targets, 3, async (sessionId) => {
-          try {
-            const nextEntry = await this.collectExportContentEntry(sessionId, traceId)
-            this.exportContentStatsMemory.set(sessionId, nextEntry)
-            if (nextEntry.mediaReady) {
-              this.exportContentStatsDirtySessionIds.delete(sessionId)
-            } else {
-              this.exportContentStatsDirtySessionIds.add(sessionId)
-            }
-          } catch (error) {
-            console.error('ChatService: 刷新导出内容会话统计失败:', sessionId, error)
-            this.exportContentStatsDirtySessionIds.add(sessionId)
-          }
-        })
-      }
-
-      for (const sessionId of Array.from(this.exportContentStatsMemory.keys())) {
-        if (!sessionIdSet.has(sessionId)) {
-          this.exportContentStatsMemory.delete(sessionId)
-          this.exportContentStatsDirtySessionIds.delete(sessionId)
-        }
-      }
-
-      this.exportContentStatsScopeUpdatedAt = Date.now()
-      this.persistExportContentStatsScope(sessionIdSet)
-    })()
-
-    this.exportContentStatsRefreshPromise = task
-    try {
-      await task
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-refresh-export-content-stats',
-        stepName: '后台刷新导出内容统计',
-        startedAt: refreshStartedAt,
-        success: true,
-        message: '后台刷新导出内容统计完成',
-        data: {
-          force
-        }
-      })
-    } catch (error) {
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-refresh-export-content-stats',
-        stepName: '后台刷新导出内容统计',
-        startedAt: refreshStartedAt,
-        success: false,
-        message: '后台刷新导出内容统计失败',
-        data: { error: String(error) }
-      })
-      throw error
-    } finally {
-      this.exportContentStatsRefreshPromise = null
-      if (this.exportContentStatsRefreshQueued) {
-        const rerunForce = this.exportContentStatsRefreshForceQueued
-        this.exportContentStatsRefreshQueued = false
-        this.exportContentStatsRefreshForceQueued = false
-        void this.startExportContentStatsRefresh(rerunForce, traceId).catch((error) => {
-          console.error('ChatService: 重新触发导出内容统计刷新失败:', error)
-        })
-      }
-    }
-  }
-
-  async getExportContentSessionCounts(options?: {
-    triggerRefresh?: boolean
-    forceRefresh?: boolean
-    traceId?: string
-  }): Promise<{ success: boolean; data?: ExportContentSessionCounts; error?: string }> {
-    const traceId = this.normalizeExportDiagTraceId(options?.traceId)
-    const forceRefresh = options?.forceRefresh === true
-    const triggerRefresh = options?.triggerRefresh !== false
-    const stepStartedAt = this.startExportDiagStep({
-      traceId,
-      stepId: 'backend-get-export-content-session-counts',
-      stepName: '获取导出卡片统计',
-      message: '开始计算导出卡片统计',
-      data: {
-        triggerRefresh,
-        forceRefresh
-      }
-    })
-    let stepSuccess = false
-    let stepError = ''
-    let stepResult: ExportContentSessionCounts | undefined
-    let activePromise: Promise<{ success: boolean; data?: ExportContentSessionCounts; error?: string }> | null = null
-    let createdInFlight = false
-
-    try {
-      const connectResult = await this.ensureConnected()
-      if (!connectResult.success) {
-        stepError = connectResult.error || '数据库未连接'
-        return { success: false, error: stepError }
-      }
-      this.refreshSessionMessageCountCacheScope()
-
-      if (!forceRefresh && this.exportContentSessionCountsInFlight) {
-        const sessionIds = this.exportContentScopeSessionIdsCache?.ids || Array.from(this.exportContentStatsMemory.keys())
-        const snapshot = this.buildExportContentSessionCountsSnapshot(sessionIds, { forceRefresh: false })
-        if (triggerRefresh) {
-          if (snapshot.missingTextCountSessionIds.length > 0) {
-            void this.startExportContentTextCountsRefresh(false, traceId, sessionIds).catch((error) => {
-              console.error('ChatService: 触发文本会话计数补全失败:', error)
-            })
-          }
-          if (snapshot.pendingMediaSessionSet.size > 0 || this.exportContentStatsDirtySessionIds.size > 0) {
-            void this.startExportContentStatsRefresh(false, traceId).catch((error) => {
-              console.error('ChatService: 触发导出内容统计刷新失败:', error)
-            })
-          }
-        }
-        this.logExportDiag({
-          traceId,
-          source: 'backend',
-          level: 'info',
-          message: '返回缓存快照，后台统计任务仍在进行',
-          stepId: 'backend-get-export-content-session-counts',
-          stepName: '获取导出卡片统计',
-          status: 'running',
-          data: {
-            inFlightTraceId: this.exportContentSessionCountsInFlight.traceId,
-            inFlightElapsedMs: Date.now() - this.exportContentSessionCountsInFlight.startedAt,
-            totalSessions: snapshot.counts.totalSessions
-          }
-        })
-        stepResult = {
-          ...snapshot.counts,
-          refreshing: true
-        }
-        stepSuccess = true
-        return { success: true, data: stepResult }
-      }
-
-      if (this.exportContentSessionCountsInFlight) {
-        this.logExportDiag({
-          traceId,
-          source: 'backend',
-          level: 'info',
-          message: '复用进行中的导出卡片统计任务',
-          stepId: 'backend-get-export-content-session-counts',
-          stepName: '获取导出卡片统计',
-          status: 'running',
-          data: {
-            inFlightTraceId: this.exportContentSessionCountsInFlight.traceId,
-            inFlightForceRefresh: this.exportContentSessionCountsInFlight.forceRefresh,
-            requestedForceRefresh: forceRefresh,
-            inFlightElapsedMs: Date.now() - this.exportContentSessionCountsInFlight.startedAt
-          }
-        })
-        activePromise = this.exportContentSessionCountsInFlight.promise
-      } else {
-        const createdPromise = (async () => {
-          const sessionIds = await this.listExportContentScopeSessionIds(forceRefresh, traceId)
-          const snapshot = this.buildExportContentSessionCountsSnapshot(sessionIds, { forceRefresh })
-
-          if (triggerRefresh) {
-            if (snapshot.missingTextCountSessionIds.length > 0) {
-              void this.startExportContentTextCountsRefresh(forceRefresh, traceId, sessionIds).catch((error) => {
-                console.error('ChatService: 触发文本会话计数补全失败:', error)
-              })
-            }
-            if (forceRefresh || snapshot.pendingMediaSessionSet.size > 0 || this.exportContentStatsDirtySessionIds.size > 0) {
-              void this.startExportContentStatsRefresh(forceRefresh, traceId).catch((error) => {
-                console.error('ChatService: 触发导出内容统计刷新失败:', error)
-              })
-            }
-          }
-
-          return {
-            success: true,
-            data: {
-              ...snapshot.counts,
-              refreshing: this.exportContentStatsRefreshPromise !== null || this.exportContentTextRefreshPromise !== null
-            }
-          }
-        })()
-        activePromise = createdPromise
-        this.exportContentSessionCountsInFlight = {
-          promise: createdPromise,
-          forceRefresh,
-          traceId,
-          startedAt: Date.now()
-        }
-        createdInFlight = true
-      }
-
-      if (!activePromise) {
-        stepError = '统计任务未初始化'
-        return { success: false, error: stepError }
-      }
-
-      const result = await activePromise
-      stepSuccess = result.success
-      if (result.success && result.data) {
-        stepResult = result.data
-      } else {
-        stepError = result.error || '未知错误'
-      }
-      return result
-    } catch (e) {
-      console.error('ChatService: 获取导出内容会话统计失败:', e)
-      stepError = String(e)
-      return { success: false, error: String(e) }
-    } finally {
-      if (createdInFlight && activePromise && this.exportContentSessionCountsInFlight?.promise === activePromise) {
-        this.exportContentSessionCountsInFlight = null
-      }
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-get-export-content-session-counts',
-        stepName: '获取导出卡片统计',
-        startedAt: stepStartedAt,
-        success: stepSuccess,
-        message: stepSuccess ? '导出卡片统计计算完成' : '导出卡片统计计算失败',
-        data: stepSuccess
-          ? {
-              totalSessions: stepResult?.totalSessions || 0,
-              pendingMediaSessions: stepResult?.pendingMediaSessions || 0,
-              refreshing: stepResult?.refreshing === true
-            }
-          : { error: stepError || '未知错误' }
-      })
-    }
-  }
-
-  async refreshExportContentSessionCounts(options?: { forceRefresh?: boolean; traceId?: string }): Promise<{ success: boolean; error?: string }> {
-    const traceId = this.normalizeExportDiagTraceId(options?.traceId)
-    const stepStartedAt = this.startExportDiagStep({
-      traceId,
-      stepId: 'backend-refresh-export-content-session-counts',
-      stepName: '刷新导出卡片统计',
-      message: '开始刷新导出卡片统计',
-      data: { forceRefresh: options?.forceRefresh === true }
-    })
-    let stepSuccess = false
-    let stepError = ''
-
-    try {
-      const connectResult = await this.ensureConnected()
-      if (!connectResult.success) {
-        stepError = connectResult.error || '数据库未连接'
-        return { success: false, error: connectResult.error || '数据库未连接' }
-      }
-      this.refreshSessionMessageCountCacheScope()
-      const force = options?.forceRefresh === true
-      void this.startExportContentTextCountsRefresh(force, traceId).catch((error) => {
-        console.error('ChatService: 刷新导出卡片统计（文本计数）失败:', error)
-      })
-      void this.startExportContentStatsRefresh(force, traceId).catch((error) => {
-        console.error('ChatService: 刷新导出卡片统计（内容类型）失败:', error)
-      })
-      stepSuccess = true
-      return { success: true }
-    } catch (e) {
-      console.error('ChatService: 刷新导出内容会话统计失败:', e)
-      stepError = String(e)
-      return { success: false, error: String(e) }
-    } finally {
-      this.endExportDiagStep({
-        traceId,
-        stepId: 'backend-refresh-export-content-session-counts',
-        stepName: '刷新导出卡片统计',
-        startedAt: stepStartedAt,
-        success: stepSuccess,
-        message: stepSuccess ? '刷新导出卡片统计完成' : '刷新导出卡片统计失败',
-        data: stepSuccess ? undefined : { error: stepError || '未知错误' }
-      })
-    }
   }
 
   private refreshSessionStatsCacheScope(scope: string): void {
@@ -2751,8 +1952,6 @@ class ChatService {
 
     if (ids.size > 0) {
       ids.forEach((sessionId) => this.deleteSessionStatsCacheEntry(sessionId))
-      this.exportContentScopeSessionIdsCache = null
-      ids.forEach((sessionId) => this.exportContentStatsDirtySessionIds.add(sessionId))
       if (Array.from(ids).some((id) => id.includes('@chatroom'))) {
         this.allGroupSessionIdsCache = null
       }
@@ -2768,10 +1967,6 @@ class ChatService {
       normalizedType.includes('contact')
     ) {
       this.clearSessionStatsCacheForScope()
-      this.exportContentScopeSessionIdsCache = null
-      for (const sessionId of this.exportContentStatsMemory.keys()) {
-        this.exportContentStatsDirtySessionIds.add(sessionId)
-      }
     }
   }
 
@@ -4939,11 +4134,6 @@ class ChatService {
       this.sessionStatsCacheService.clearAll()
       this.groupMyMessageCountMemoryCache.clear()
       this.groupMyMessageCountCacheService.clearAll()
-      this.exportContentStatsMemory.clear()
-      this.exportContentStatsDirtySessionIds.clear()
-      this.exportContentScopeSessionIdsCache = null
-      this.exportContentStatsScopeUpdatedAt = 0
-      this.exportContentStatsCacheService.clearAll()
     }
 
     for (const state of this.hardlinkCache.values()) {

@@ -44,6 +44,68 @@ export interface SnsPost {
     linkUrl?: string
 }
 
+interface SnsContactIdentity {
+    username: string
+    wxid: string
+    alias?: string
+    wechatId?: string
+    remark?: string
+    nickName?: string
+    displayName: string
+}
+
+interface ParsedLikeUser {
+    username?: string
+    nickname?: string
+}
+
+interface ParsedCommentItem {
+    id: string
+    nickname: string
+    username?: string
+    content: string
+    refCommentId: string
+    refUsername?: string
+    refNickname?: string
+    emojis?: { url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }[]
+}
+
+interface ArkmeLikeDetail {
+    nickname: string
+    username?: string
+    wxid?: string
+    alias?: string
+    wechatId?: string
+    remark?: string
+    nickName?: string
+    displayName: string
+    source: 'xml' | 'legacy'
+}
+
+interface ArkmeCommentDetail {
+    id: string
+    nickname: string
+    username?: string
+    wxid?: string
+    alias?: string
+    wechatId?: string
+    remark?: string
+    nickName?: string
+    displayName: string
+    content: string
+    refCommentId: string
+    refNickname?: string
+    refUsername?: string
+    refWxid?: string
+    refAlias?: string
+    refWechatId?: string
+    refRemark?: string
+    refNickName?: string
+    refDisplayName?: string
+    emojis?: { url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }[]
+    source: 'xml' | 'legacy'
+}
+
 
 
 const fixSnsUrl = (url: string, token?: string, isVideo: boolean = false) => {
@@ -127,7 +189,7 @@ const extractVideoKey = (xml: string): string | undefined => {
 /**
  * 从 XML 中解析评论信息（含表情包、回复关系）
  */
-function parseCommentsFromXml(xml: string): { id: string; nickname: string; content: string; refCommentId: string; refNickname?: string; emojis?: { url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }[] }[] {
+function parseCommentsFromXml(xml: string): ParsedCommentItem[] {
     if (!xml) return []
 
     type CommentItem = {
@@ -237,6 +299,204 @@ class SnsService {
     constructor() {
         this.configService = new ConfigService()
         this.contactCache = new ContactCacheService(this.configService.get('cachePath') as string)
+    }
+
+    private toOptionalString(value: unknown): string | undefined {
+        if (typeof value !== 'string') return undefined
+        const trimmed = value.trim()
+        return trimmed.length > 0 ? trimmed : undefined
+    }
+
+    private async resolveContactIdentity(
+        username: string,
+        identityCache: Map<string, Promise<SnsContactIdentity | null>>
+    ): Promise<SnsContactIdentity | null> {
+        const normalized = String(username || '').trim()
+        if (!normalized) return null
+
+        let pending = identityCache.get(normalized)
+        if (!pending) {
+            pending = (async () => {
+                const cached = this.contactCache.get(normalized)
+                let alias: string | undefined
+                let remark: string | undefined
+                let nickName: string | undefined
+
+                try {
+                    const contactResult = await wcdbService.getContact(normalized)
+                    if (contactResult.success && contactResult.contact) {
+                        const contact = contactResult.contact
+                        alias = this.toOptionalString(contact.alias ?? contact.Alias)
+                        remark = this.toOptionalString(contact.remark ?? contact.Remark)
+                        nickName = this.toOptionalString(contact.nickName ?? contact.nick_name ?? contact.nickname ?? contact.NickName)
+                    }
+                } catch {
+                    // 联系人补全失败不影响导出
+                }
+
+                const displayName = remark || nickName || alias || cached?.displayName || normalized
+                return {
+                    username: normalized,
+                    wxid: normalized,
+                    alias,
+                    wechatId: alias,
+                    remark,
+                    nickName,
+                    displayName
+                }
+            })()
+            identityCache.set(normalized, pending)
+        }
+
+        return pending
+    }
+
+    private parseLikeUsersFromXml(xml: string): ParsedLikeUser[] {
+        if (!xml) return []
+        const likes: ParsedLikeUser[] = []
+        try {
+            let likeListMatch = xml.match(/<LikeUserList>([\s\S]*?)<\/LikeUserList>/i)
+            if (!likeListMatch) likeListMatch = xml.match(/<likeUserList>([\s\S]*?)<\/likeUserList>/i)
+            if (!likeListMatch) likeListMatch = xml.match(/<likeList>([\s\S]*?)<\/likeList>/i)
+            if (!likeListMatch) likeListMatch = xml.match(/<like_user_list>([\s\S]*?)<\/like_user_list>/i)
+            if (!likeListMatch) return likes
+
+            const likeUserRegex = /<(?:LikeUser|likeUser|user_comment)>([\s\S]*?)<\/(?:LikeUser|likeUser|user_comment)>/gi
+            let m: RegExpExecArray | null
+            while ((m = likeUserRegex.exec(likeListMatch[1])) !== null) {
+                const block = m[1]
+                const username = this.toOptionalString(block.match(/<username>([^<]*)<\/username>/i)?.[1])
+                const nickname = this.toOptionalString(
+                    block.match(/<nickname>([^<]*)<\/nickname>/i)?.[1]
+                    || block.match(/<nickName>([^<]*)<\/nickName>/i)?.[1]
+                )
+                if (username || nickname) {
+                    likes.push({ username, nickname })
+                }
+            }
+        } catch (e) {
+            console.error('[SnsService] 解析点赞用户失败:', e)
+        }
+        return likes
+    }
+
+    private async buildArkmeInteractionDetails(
+        post: SnsPost,
+        identityCache: Map<string, Promise<SnsContactIdentity | null>>
+    ): Promise<{ likesDetail: ArkmeLikeDetail[]; commentsDetail: ArkmeCommentDetail[] }> {
+        const xmlLikes = this.parseLikeUsersFromXml(post.rawXml || '')
+        const likeCandidates: ParsedLikeUser[] = xmlLikes.length > 0
+            ? xmlLikes
+            : (post.likes || []).map((nickname) => ({ nickname }))
+        const likeSource: 'xml' | 'legacy' = xmlLikes.length > 0 ? 'xml' : 'legacy'
+        const likesDetail: ArkmeLikeDetail[] = []
+        const likeSeen = new Set<string>()
+
+        for (const like of likeCandidates) {
+            const identity = like.username
+                ? await this.resolveContactIdentity(like.username, identityCache)
+                : null
+            const nickname = like.nickname || identity?.displayName || like.username || ''
+            const username = identity?.username || like.username
+            const key = `${username || ''}|${nickname}`
+            if (likeSeen.has(key)) continue
+            likeSeen.add(key)
+            likesDetail.push({
+                nickname,
+                username,
+                wxid: username,
+                alias: identity?.alias,
+                wechatId: identity?.wechatId,
+                remark: identity?.remark,
+                nickName: identity?.nickName,
+                displayName: identity?.displayName || nickname || username || '',
+                source: likeSource
+            })
+        }
+
+        const xmlComments = parseCommentsFromXml(post.rawXml || '')
+        const commentMap = new Map<string, SnsPost['comments'][number]>()
+        for (const comment of post.comments || []) {
+            if (comment.id) commentMap.set(comment.id, comment)
+        }
+
+        const commentsBase: ParsedCommentItem[] = xmlComments.length > 0
+            ? xmlComments.map((comment) => {
+                const fallback = comment.id ? commentMap.get(comment.id) : undefined
+                return {
+                    id: comment.id || fallback?.id || '',
+                    nickname: comment.nickname || fallback?.nickname || '',
+                    username: comment.username,
+                    content: comment.content || fallback?.content || '',
+                    refCommentId: comment.refCommentId || fallback?.refCommentId || '',
+                    refUsername: comment.refUsername,
+                    refNickname: comment.refNickname || fallback?.refNickname,
+                    emojis: comment.emojis && comment.emojis.length > 0 ? comment.emojis : fallback?.emojis
+                }
+            })
+            : (post.comments || []).map((comment) => ({
+                id: comment.id || '',
+                nickname: comment.nickname || '',
+                content: comment.content || '',
+                refCommentId: comment.refCommentId || '',
+                refNickname: comment.refNickname,
+                emojis: comment.emojis
+            }))
+
+        if (xmlComments.length > 0) {
+            const mappedIds = new Set(commentsBase.map((comment) => comment.id).filter(Boolean))
+            for (const comment of post.comments || []) {
+                if (comment.id && mappedIds.has(comment.id)) continue
+                commentsBase.push({
+                    id: comment.id || '',
+                    nickname: comment.nickname || '',
+                    content: comment.content || '',
+                    refCommentId: comment.refCommentId || '',
+                    refNickname: comment.refNickname,
+                    emojis: comment.emojis
+                })
+            }
+        }
+
+        const commentSource: 'xml' | 'legacy' = xmlComments.length > 0 ? 'xml' : 'legacy'
+        const commentsDetail: ArkmeCommentDetail[] = []
+
+        for (const comment of commentsBase) {
+            const actor = comment.username
+                ? await this.resolveContactIdentity(comment.username, identityCache)
+                : null
+            const refActor = comment.refUsername
+                ? await this.resolveContactIdentity(comment.refUsername, identityCache)
+                : null
+            const nickname = comment.nickname || actor?.displayName || comment.username || ''
+            const username = actor?.username || comment.username
+            const refUsername = refActor?.username || comment.refUsername
+            commentsDetail.push({
+                id: comment.id || '',
+                nickname,
+                username,
+                wxid: username,
+                alias: actor?.alias,
+                wechatId: actor?.wechatId,
+                remark: actor?.remark,
+                nickName: actor?.nickName,
+                displayName: actor?.displayName || nickname || username || '',
+                content: comment.content || '',
+                refCommentId: comment.refCommentId || '',
+                refNickname: comment.refNickname || refActor?.displayName,
+                refUsername,
+                refWxid: refUsername,
+                refAlias: refActor?.alias,
+                refWechatId: refActor?.wechatId,
+                refRemark: refActor?.remark,
+                refNickName: refActor?.nickName,
+                refDisplayName: refActor?.displayName,
+                emojis: comment.emojis,
+                source: commentSource
+            })
+        }
+
+        return { likesDetail, commentsDetail }
     }
 
     private parseCountValue(row: any): number {
@@ -821,7 +1081,7 @@ class SnsService {
      */
     async exportTimeline(options: {
         outputDir: string
-        format: 'json' | 'html'
+        format: 'json' | 'html' | 'arkmejson'
         usernames?: string[]
         keyword?: string
         exportMedia?: boolean
@@ -1024,6 +1284,71 @@ class SnsService {
                         linkTitle: (p as any).linkTitle,
                         linkUrl: (p as any).linkUrl
                     }))
+                }
+                await writeFile(outputFilePath, JSON.stringify(exportData, null, 2), 'utf-8')
+            } else if (format === 'arkmejson') {
+                outputFilePath = join(outputDir, `朋友圈导出_${timestamp}.json`)
+                progressCallback?.({ current: 0, total: allPosts.length, status: '正在构建 ArkmeJSON 数据...' })
+
+                const identityCache = new Map<string, Promise<SnsContactIdentity | null>>()
+                const posts: any[] = []
+                let built = 0
+
+                for (const post of allPosts) {
+                    const controlState = getControlState()
+                    if (controlState) {
+                        return buildInterruptedResult(controlState, allPosts.length, mediaCount)
+                    }
+
+                    const authorIdentity = await this.resolveContactIdentity(post.username, identityCache)
+                    const { likesDetail, commentsDetail } = await this.buildArkmeInteractionDetails(post, identityCache)
+
+                    posts.push({
+                        id: post.id,
+                        username: post.username,
+                        nickname: post.nickname,
+                        author: authorIdentity
+                            ? {
+                                ...authorIdentity
+                            }
+                            : {
+                                username: post.username,
+                                wxid: post.username,
+                                displayName: post.nickname || post.username
+                            },
+                        createTime: post.createTime,
+                        createTimeStr: new Date(post.createTime * 1000).toLocaleString('zh-CN'),
+                        contentDesc: post.contentDesc,
+                        type: post.type,
+                        media: post.media.map(m => ({
+                            url: m.url,
+                            thumb: m.thumb,
+                            localPath: (m as any).localPath || undefined
+                        })),
+                        likes: post.likes,
+                        comments: post.comments,
+                        likesDetail,
+                        commentsDetail,
+                        linkTitle: (post as any).linkTitle,
+                        linkUrl: (post as any).linkUrl
+                    })
+
+                    built++
+                    if (built % 20 === 0 || built === allPosts.length) {
+                        progressCallback?.({ current: built, total: allPosts.length, status: `正在构建 ArkmeJSON 数据 (${built}/${allPosts.length})...` })
+                    }
+                }
+
+                const exportData = {
+                    exportTime: new Date().toISOString(),
+                    format: 'arkmejson',
+                    schemaVersion: '1.0.0',
+                    totalPosts: allPosts.length,
+                    filters: {
+                        usernames: usernames || [],
+                        keyword: keyword || ''
+                    },
+                    posts
                 }
                 await writeFile(outputFilePath, JSON.stringify(exportData, null, 2), 'utf-8')
             } else {
