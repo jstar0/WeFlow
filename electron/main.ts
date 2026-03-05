@@ -24,7 +24,7 @@ import { windowsHelloService } from './services/windowsHelloService'
 import { exportCardDiagnosticsService } from './services/exportCardDiagnosticsService'
 import { cloudControlService } from './services/cloudControlService'
 
-import { registerNotificationHandlers, showNotification } from './windows/notificationWindow'
+import { destroyNotificationWindow, registerNotificationHandlers, showNotification } from './windows/notificationWindow'
 import { httpService } from './services/httpService'
 
 
@@ -92,6 +92,7 @@ const keyService = new KeyService()
 
 let mainWindowReady = false
 let shouldShowMain = true
+let isAppQuitting = false
 
 // 更新下载状态管理（Issue #294 修复）
 let isDownloadInProgress = false
@@ -330,6 +331,21 @@ function createWindow(options: { autoShow?: boolean } = {}) {
       }
     } catch {}
     callback(false)
+  })
+
+  win.on('closed', () => {
+    if (mainWindow !== win) return
+
+    mainWindow = null
+    mainWindowReady = false
+
+    if (process.platform !== 'darwin' && !isAppQuitting) {
+      // 隐藏通知窗也是 BrowserWindow，必须销毁，否则会阻止应用退出。
+      destroyNotificationWindow()
+      if (BrowserWindow.getAllWindows().length === 0) {
+        app.quit()
+      }
+    }
   })
 
   return win
@@ -2427,6 +2443,9 @@ app.whenReady().then(async () => {
 })
 
 app.on('before-quit', async () => {
+  isAppQuitting = true
+  // 通知窗使用 hide 而非 close，退出时主动销毁，避免残留窗口阻塞进程退出。
+  destroyNotificationWindow()
   // 停止 HTTP 服务器，释放 TCP 端口占用，避免进程无法退出
   try { await httpService.stop() } catch {}
   // 终止 wcdb Worker 线程，避免线程阻止进程退出
