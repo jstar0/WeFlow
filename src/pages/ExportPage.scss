@@ -2112,10 +2112,6 @@
     &.selected .contact-item {
       background: rgba(var(--primary-rgb), 0.08);
     }
-
-    &.selected .row-action-cell {
-      background: rgba(var(--primary-rgb), 0.08);
-    }
   }
 
   .contact-item {
@@ -2507,18 +2503,7 @@
   position: sticky;
   right: 0;
   z-index: 10;
-  background: var(--bg-secondary);
-
-  &::before {
-    content: '';
-    position: absolute;
-    top: -12px;
-    bottom: -12px;
-    left: -8px;
-    width: 8px;
-    pointer-events: none;
-    background: linear-gradient(to right, transparent, var(--bg-secondary));
-  }
+  background: transparent;
 
   .row-action-main {
     display: inline-flex;
