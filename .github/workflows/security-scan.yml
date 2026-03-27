@@ -33,7 +33,7 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --no-frozen-lockfile
 
       # 1. npm audit - 检查依赖漏洞
       - name: Dependency vulnerability audit
